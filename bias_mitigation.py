@@ -113,32 +113,6 @@ def load_and_preprocess_data(file_path):
     return X, y, df
 
 
-def create_baseline_model(X_train, y_train, X_test, y_test, sex_test, X_test_raw=None):
-    """Create and evaluate baseline model"""
-    print("\n" + "="*50)
-    print("BASELINE MODEL (Logistic Regression)")
-    print("="*50)
-
-    # Train baseline model
-    baseline_model = LogisticRegression(max_iter=1000, random_state=42)
-    baseline_model.fit(X_train, y_train)
-
-    # Predictions
-    y_pred_proba = baseline_model.predict_proba(X_test)[:, 1]
-    y_pred = (y_pred_proba >= 0.5).astype(int)
-
-    if X_test_raw is not None:
-        baseline_eval_df = X_test_raw.copy()
-        baseline_eval_df['EMPLOYED'] = np.asarray(y_test)
-        baseline_eval_df['PRED'] = y_pred_proba
-        base_model_eval_result = evaluate_with_tfma(baseline_eval_df, prediction_key='PRED')
-        print("\nTFMA evaluation completed for the baseline model.")
-        print("  Overall slice and SEX slice metrics are available in the TFMA result object.")
-        print_tfma_text_summary(base_model_eval_result, "Base Model")
-
-    return baseline_model
-
-
 def create_mitigated_model(X_train, y_train, X_test, y_test, sex_train, sex_test, X_test_raw=None):
     """
     Create bias-mitigated model using multiple techniques:
@@ -298,11 +272,6 @@ def main():
     # Convert back to DataFrame to keep feature names
     X_train_scaled = pd.DataFrame(X_train_scaled, columns=X_train.columns)
     X_test_scaled = pd.DataFrame(X_test_scaled, columns=X_test.columns)
-
-    # Train and evaluate baseline model
-    create_baseline_model(
-        X_train_scaled, y_train, X_test_scaled, y_test, sex_test, X_test_raw=X_test_raw
-    )
 
     # Train and evaluate mitigated model
     create_mitigated_model(
