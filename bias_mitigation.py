@@ -196,7 +196,7 @@ def create_mitigated_model(X_train, y_train, X_test, y_test, sex_train, sex_test
         mitigated_model_eval_result = evaluate_with_tfma(mitigated_eval_df, prediction_key='PRED')
         print("\nTFMA evaluation completed for the mitigated model.")
         print("  Overall slice and SEX slice metrics are available in the TFMA result object.")
-        print_tfma_text_summary(mitigated_model_eval_result, "MinDiff Model")
+        print_tfma_text_summary(mitigated_model_eval_result, "")
 
     return (model1, model2, model3), thresholds
 
