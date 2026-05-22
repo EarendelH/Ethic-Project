@@ -14,107 +14,87 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from xgboost import XGBClassifier
 from imblearn.over_sampling import SMOTE
-import matplotlib.pyplot as plt
-import seaborn as sns
+import tensorflow_model_analysis as tfma
+from google.protobuf import text_format
 import warnings
 warnings.filterwarnings('ignore')
 
 # Set random seeds for reproducibility
 np.random.seed(42)
 
-class FairnessMetrics:
-    """Calculate various fairness metrics for model evaluation"""
+def build_tfma_eval_config(prediction_key, label_key, sensitive_attribute_key):
+    eval_config_pbtxt = """
+      model_specs {
+        prediction_key: "%s"
+        label_key: "%s" }
+      metrics_specs {
+        metrics { class_name: "ExampleCount" }
+        metrics { class_name: "BinaryAccuracy" }
+        metrics { class_name: "AUC" }
+        metrics { class_name: "ConfusionMatrixPlot" }
+        metrics {
+          class_name: "FairnessIndicators"
+          config: '{"thresholds": [0.50]}'
+        }
+      }
+      slicing_specs {
+        feature_keys: "%s"
+      }
+      slicing_specs {}
+    """ % (prediction_key, label_key, sensitive_attribute_key)
+    return text_format.Parse(eval_config_pbtxt, tfma.EvalConfig())
 
-    @staticmethod
-    def demographic_parity_difference(y_true, y_pred, sensitive_attr):
-        """Calculate demographic parity difference between groups"""
-        groups = np.unique(sensitive_attr)
-        selection_rates = []
-        for group in groups:
-            mask = sensitive_attr == group
-            selection_rate = np.mean(y_pred[mask])
-            selection_rates.append(selection_rate)
-        return abs(selection_rates[0] - selection_rates[1])
 
-    @staticmethod
-    def equal_opportunity_difference(y_true, y_pred, sensitive_attr):
-        """Calculate difference in True Positive Rates (TPR) between groups"""
-        groups = np.unique(sensitive_attr)
-        tpr_list = []
-        for group in groups:
-            mask = (sensitive_attr == group) & (y_true == 1)
-            if np.sum(mask) > 0:
-                tpr = np.mean(y_pred[mask])
-                tpr_list.append(tpr)
-            else:
-                tpr_list.append(0)
-        return abs(tpr_list[0] - tpr_list[1])
+def evaluate_with_tfma(dataframe, prediction_key, label_key='EMPLOYED', sensitive_attribute_key='SEX'):
+    tfma_input = dataframe.copy()
 
-    @staticmethod
-    def equalized_odds_difference(y_true, y_pred, sensitive_attr):
-        """Calculate difference in TPR and FPR between groups"""
-        groups = np.unique(sensitive_attr)
-        tpr_diff = FairnessMetrics.equal_opportunity_difference(y_true, y_pred, sensitive_attr)
+    if tfma_input[sensitive_attribute_key].dtype != object:
+        tfma_input[sensitive_attribute_key] = tfma_input[sensitive_attribute_key].replace(
+            {1.0: 'Male', 2.0: 'Female'})
 
-        # Calculate FPR difference
-        fpr_list = []
-        for group in groups:
-            mask = (sensitive_attr == group) & (y_true == 0)
-            if np.sum(mask) > 0:
-                fpr = np.mean(y_pred[mask])
-                fpr_list.append(fpr)
-            else:
-                fpr_list.append(0)
-        fpr_diff = abs(fpr_list[0] - fpr_list[1])
+    eval_config = build_tfma_eval_config(prediction_key, label_key, sensitive_attribute_key)
+    return tfma.analyze_raw_data(tfma_input, eval_config)
 
-        return (tpr_diff + fpr_diff) / 2
 
-    @staticmethod
-    def calculate_all_metrics(y_true, y_pred, y_pred_binary, sensitive_attr):
-        """Calculate all fairness and performance metrics"""
-        metrics = {}
+def _format_slice_name(slice_name):
+    if slice_name == ():  # noqa: E711 - intentional tuple literal for TFMA overall slice
+        return "Overall"
+    parts = []
+    for key, value in slice_name:
+        parts.append(f"{key}={value}")
+    return ", ".join(parts)
 
-        # Performance metrics
-        metrics['accuracy'] = accuracy_score(y_true, y_pred_binary)
-        metrics['auc'] = roc_auc_score(y_true, y_pred)
 
-        # Confusion matrix for overall
-        tn, fp, fn, tp = confusion_matrix(y_true, y_pred_binary).ravel()
-        metrics['tpr'] = tp / (tp + fn) if (tp + fn) > 0 else 0
-        metrics['fpr'] = fp / (fp + tn) if (fp + tn) > 0 else 0
-        metrics['fnr'] = fn / (fn + tp) if (fn + tp) > 0 else 0
-        metrics['tnr'] = tn / (tn + fp) if (tn + fp) > 0 else 0
+def _format_tfma_value(value):
+    if isinstance(value, dict):
+        if "doubleValue" in value:
+            return f"{value['doubleValue']:.4f}"
+        if "value" in value and isinstance(value["value"], (int, float)):
+            return f"{value['value']:.4f}"
+        if "boundedValue" in value and isinstance(value["boundedValue"], dict):
+            bounded = value["boundedValue"]
+            lower = bounded.get("lowerBound")
+            upper = bounded.get("upperBound")
+            mean = bounded.get("value")
+            return f"{mean:.4f} [{lower:.4f}, {upper:.4f}]"
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value)
 
-        # Fairness metrics
-        metrics['demographic_parity_diff'] = FairnessMetrics.demographic_parity_difference(
-            y_true, y_pred_binary, sensitive_attr)
-        metrics['equal_opportunity_diff'] = FairnessMetrics.equal_opportunity_difference(
-            y_true, y_pred_binary, sensitive_attr)
-        metrics['equalized_odds_diff'] = FairnessMetrics.equalized_odds_difference(
-            y_true, y_pred_binary, sensitive_attr)
 
-        # Group-specific metrics
-        groups = np.unique(sensitive_attr)
-        for group in groups:
-            mask = sensitive_attr == group
-            group_name = 'male' if group == 1.0 else 'female'
-
-            y_true_group = y_true[mask]
-            y_pred_binary_group = y_pred_binary[mask]
-
-            if len(y_true_group) > 0:
-                tn_g, fp_g, fn_g, tp_g = confusion_matrix(y_true_group, y_pred_binary_group).ravel()
-                metrics[f'{group_name}_tpr'] = tp_g / (tp_g + fn_g) if (tp_g + fn_g) > 0 else 0
-                metrics[f'{group_name}_fpr'] = fp_g / (fp_g + tn_g) if (fp_g + tn_g) > 0 else 0
-                metrics[f'{group_name}_fnr'] = fn_g / (fn_g + tp_g) if (fn_g + tp_g) > 0 else 0
-                metrics[f'{group_name}_accuracy'] = accuracy_score(y_true_group, y_pred_binary_group)
-
-        return metrics
+def print_tfma_text_summary(eval_result, title):
+    print(f"\nTFMA Text Summary: {title}")
+    metrics_by_slice = eval_result.get_metrics_for_all_slices()
+    for slice_name in sorted(metrics_by_slice.keys(), key=str):
+        print(f"\nSlice: {_format_slice_name(slice_name)}")
+        metrics = metrics_by_slice[slice_name]
+        for metric_name in sorted(metrics.keys()):
+            print(f"  {metric_name}: {_format_tfma_value(metrics[metric_name])}")
 
 
 def load_and_preprocess_data(file_path):
@@ -133,7 +113,7 @@ def load_and_preprocess_data(file_path):
     return X, y, df
 
 
-def create_baseline_model(X_train, y_train, X_test, y_test, sex_test):
+def create_baseline_model(X_train, y_train, X_test, y_test, sex_test, X_test_raw=None):
     """Create and evaluate baseline model"""
     print("\n" + "="*50)
     print("BASELINE MODEL (Logistic Regression)")
@@ -147,30 +127,19 @@ def create_baseline_model(X_train, y_train, X_test, y_test, sex_test):
     y_pred_proba = baseline_model.predict_proba(X_test)[:, 1]
     y_pred = (y_pred_proba >= 0.5).astype(int)
 
-    # Calculate metrics
-    metrics = FairnessMetrics.calculate_all_metrics(y_test, y_pred_proba, y_pred, sex_test)
+    if X_test_raw is not None:
+        baseline_eval_df = X_test_raw.copy()
+        baseline_eval_df['EMPLOYED'] = np.asarray(y_test)
+        baseline_eval_df['PRED'] = y_pred_proba
+        base_model_eval_result = evaluate_with_tfma(baseline_eval_df, prediction_key='PRED')
+        print("\nTFMA evaluation completed for the baseline model.")
+        print("  Overall slice and SEX slice metrics are available in the TFMA result object.")
+        print_tfma_text_summary(base_model_eval_result, "Base Model")
 
-    print(f"\nPerformance Metrics:")
-    print(f"  Accuracy: {metrics['accuracy']:.4f}")
-    print(f"  AUC: {metrics['auc']:.4f}")
-    print(f"  TPR (Recall): {metrics['tpr']:.4f}")
-    print(f"  FPR: {metrics['fpr']:.4f}")
-    print(f"  FNR: {metrics['fnr']:.4f}")
-
-    print(f"\nFairness Metrics:")
-    print(f"  Demographic Parity Difference: {metrics['demographic_parity_diff']:.4f}")
-    print(f"  Equal Opportunity Difference: {metrics['equal_opportunity_diff']:.4f}")
-    print(f"  Equalized Odds Difference: {metrics['equalized_odds_diff']:.4f}")
-
-    print(f"\nGroup-specific Metrics:")
-    print(f"  Male TPR: {metrics['male_tpr']:.4f}, Female TPR: {metrics['female_tpr']:.4f}")
-    print(f"  Male FNR: {metrics['male_fnr']:.4f}, Female FNR: {metrics['female_fnr']:.4f}")
-    print(f"  Male FPR: {metrics['male_fpr']:.4f}, Female FPR: {metrics['female_fpr']:.4f}")
-
-    return baseline_model, metrics
+    return baseline_model
 
 
-def create_mitigated_model(X_train, y_train, X_test, y_test, sex_train, sex_test):
+def create_mitigated_model(X_train, y_train, X_test, y_test, sex_train, sex_test, X_test_raw=None):
     """
     Create bias-mitigated model using multiple techniques:
     1. Reweighting samples based on sensitive attribute and label
@@ -220,27 +189,16 @@ def create_mitigated_model(X_train, y_train, X_test, y_test, sex_train, sex_test
         mask = sex_test == group
         y_pred[mask] = (y_pred_proba[mask] >= threshold).astype(int)
 
-    # Calculate metrics
-    metrics = FairnessMetrics.calculate_all_metrics(y_test, y_pred_proba, y_pred, sex_test)
+    if X_test_raw is not None:
+        mitigated_eval_df = X_test_raw.copy()
+        mitigated_eval_df['EMPLOYED'] = np.asarray(y_test)
+        mitigated_eval_df['PRED'] = y_pred_proba
+        mitigated_model_eval_result = evaluate_with_tfma(mitigated_eval_df, prediction_key='PRED')
+        print("\nTFMA evaluation completed for the mitigated model.")
+        print("  Overall slice and SEX slice metrics are available in the TFMA result object.")
+        print_tfma_text_summary(mitigated_model_eval_result, "MinDiff Model")
 
-    print(f"\nPerformance Metrics:")
-    print(f"  Accuracy: {metrics['accuracy']:.4f}")
-    print(f"  AUC: {metrics['auc']:.4f}")
-    print(f"  TPR (Recall): {metrics['tpr']:.4f}")
-    print(f"  FPR: {metrics['fpr']:.4f}")
-    print(f"  FNR: {metrics['fnr']:.4f}")
-
-    print(f"\nFairness Metrics:")
-    print(f"  Demographic Parity Difference: {metrics['demographic_parity_diff']:.4f}")
-    print(f"  Equal Opportunity Difference: {metrics['equal_opportunity_diff']:.4f}")
-    print(f"  Equalized Odds Difference: {metrics['equalized_odds_diff']:.4f}")
-
-    print(f"\nGroup-specific Metrics:")
-    print(f"  Male TPR: {metrics['male_tpr']:.4f}, Female TPR: {metrics['female_tpr']:.4f}")
-    print(f"  Male FNR: {metrics['male_fnr']:.4f}, Female FNR: {metrics['female_fnr']:.4f}")
-    print(f"  Male FPR: {metrics['male_fpr']:.4f}, Female FPR: {metrics['female_fpr']:.4f}")
-
-    return (model1, model2, model3), thresholds, metrics
+    return (model1, model2, model3), thresholds
 
 
 def calculate_fairness_weights(y, sensitive_attr):
@@ -308,88 +266,6 @@ def optimize_thresholds_for_fairness(y_true, y_pred_proba, sensitive_attr):
     return thresholds
 
 
-def plot_comparison(baseline_metrics, mitigated_metrics, save_path='results_comparison.png'):
-    """Plot comparison between baseline and mitigated models"""
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-
-    # Performance metrics comparison
-    performance_metrics = ['accuracy', 'auc', 'tpr', 'fnr']
-    baseline_perf = [baseline_metrics[m] for m in performance_metrics]
-    mitigated_perf = [mitigated_metrics[m] for m in performance_metrics]
-
-    x = np.arange(len(performance_metrics))
-    width = 0.35
-
-    axes[0, 0].bar(x - width/2, baseline_perf, width, label='Baseline', alpha=0.8)
-    axes[0, 0].bar(x + width/2, mitigated_perf, width, label='Mitigated', alpha=0.8)
-    axes[0, 0].set_ylabel('Score')
-    axes[0, 0].set_title('Performance Metrics Comparison')
-    axes[0, 0].set_xticks(x)
-    axes[0, 0].set_xticklabels(['Accuracy', 'AUC', 'TPR', 'FNR'])
-    axes[0, 0].legend()
-    axes[0, 0].grid(axis='y', alpha=0.3)
-
-    # Fairness metrics comparison
-    fairness_metrics = ['demographic_parity_diff', 'equal_opportunity_diff', 'equalized_odds_diff']
-    baseline_fair = [baseline_metrics[m] for m in fairness_metrics]
-    mitigated_fair = [mitigated_metrics[m] for m in fairness_metrics]
-
-    x = np.arange(len(fairness_metrics))
-    axes[0, 1].bar(x - width/2, baseline_fair, width, label='Baseline', alpha=0.8)
-    axes[0, 1].bar(x + width/2, mitigated_fair, width, label='Mitigated', alpha=0.8)
-    axes[0, 1].set_ylabel('Difference')
-    axes[0, 1].set_title('Fairness Metrics Comparison (Lower is Better)')
-    axes[0, 1].set_xticks(x)
-    axes[0, 1].set_xticklabels(['Demographic\nParity', 'Equal\nOpportunity', 'Equalized\nOdds'], fontsize=9)
-    axes[0, 1].legend()
-    axes[0, 1].grid(axis='y', alpha=0.3)
-
-    # Group-specific TPR comparison
-    groups = ['Male', 'Female']
-    baseline_tpr = [baseline_metrics['male_tpr'], baseline_metrics['female_tpr']]
-    mitigated_tpr = [mitigated_metrics['male_tpr'], mitigated_metrics['female_tpr']]
-
-    x = np.arange(len(groups))
-    axes[1, 0].bar(x - width/2, baseline_tpr, width, label='Baseline', alpha=0.8)
-    axes[1, 0].bar(x + width/2, mitigated_tpr, width, label='Mitigated', alpha=0.8)
-    axes[1, 0].set_ylabel('True Positive Rate')
-    axes[1, 0].set_title('TPR by Group (Higher and More Equal is Better)')
-    axes[1, 0].set_xticks(x)
-    axes[1, 0].set_xticklabels(groups)
-    axes[1, 0].legend()
-    axes[1, 0].grid(axis='y', alpha=0.3)
-
-    # Group-specific FNR comparison
-    baseline_fnr = [baseline_metrics['male_fnr'], baseline_metrics['female_fnr']]
-    mitigated_fnr = [mitigated_metrics['male_fnr'], mitigated_metrics['female_fnr']]
-
-    axes[1, 1].bar(x - width/2, baseline_fnr, width, label='Baseline', alpha=0.8)
-    axes[1, 1].bar(x + width/2, mitigated_fnr, width, label='Mitigated', alpha=0.8)
-    axes[1, 1].set_ylabel('False Negative Rate')
-    axes[1, 1].set_title('FNR by Group (Lower and More Equal is Better)')
-    axes[1, 1].set_xticks(x)
-    axes[1, 1].set_xticklabels(groups)
-    axes[1, 1].legend()
-    axes[1, 1].grid(axis='y', alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"\nComparison plot saved to {save_path}")
-    plt.close()
-
-
-def save_results_to_csv(baseline_metrics, mitigated_metrics, save_path='results_metrics.csv'):
-    """Save metrics comparison to CSV"""
-    results_df = pd.DataFrame({
-        'Metric': list(baseline_metrics.keys()),
-        'Baseline': list(baseline_metrics.values()),
-        'Mitigated': list(mitigated_metrics.values())
-    })
-    results_df['Improvement'] = results_df['Mitigated'] - results_df['Baseline']
-    results_df.to_csv(save_path, index=False)
-    print(f"Results saved to {save_path}")
-
-
 def main():
     """Main execution function"""
     print("="*70)
@@ -404,6 +280,10 @@ def main():
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
+
+    # Keep raw copies for TFMA evaluation and slice display.
+    X_train_raw = X_train.copy()
+    X_test_raw = X_test.copy()
 
     # Extract sensitive attribute
     sex_train = X_train['SEX'].values
@@ -420,49 +300,14 @@ def main():
     X_test_scaled = pd.DataFrame(X_test_scaled, columns=X_test.columns)
 
     # Train and evaluate baseline model
-    baseline_model, baseline_metrics = create_baseline_model(
-        X_train_scaled, y_train, X_test_scaled, y_test, sex_test
+    create_baseline_model(
+        X_train_scaled, y_train, X_test_scaled, y_test, sex_test, X_test_raw=X_test_raw
     )
 
     # Train and evaluate mitigated model
-    mitigated_models, thresholds, mitigated_metrics = create_mitigated_model(
-        X_train_scaled, y_train, X_test_scaled, y_test, sex_train, sex_test
+    create_mitigated_model(
+        X_train_scaled, y_train, X_test_scaled, y_test, sex_train, sex_test, X_test_raw=X_test_raw
     )
-
-    # Compare results
-    print("\n" + "="*70)
-    print("COMPARISON SUMMARY")
-    print("="*70)
-
-    print("\nPerformance Comparison:")
-    print(f"  Accuracy: Baseline={baseline_metrics['accuracy']:.4f}, "
-          f"Mitigated={mitigated_metrics['accuracy']:.4f}, "
-          f"Diff={mitigated_metrics['accuracy']-baseline_metrics['accuracy']:.4f}")
-    print(f"  AUC: Baseline={baseline_metrics['auc']:.4f}, "
-          f"Mitigated={mitigated_metrics['auc']:.4f}, "
-          f"Diff={mitigated_metrics['auc']-baseline_metrics['auc']:.4f}")
-
-    print("\nFairness Comparison:")
-    print(f"  Equal Opportunity Diff: Baseline={baseline_metrics['equal_opportunity_diff']:.4f}, "
-          f"Mitigated={mitigated_metrics['equal_opportunity_diff']:.4f}, "
-          f"Improvement={baseline_metrics['equal_opportunity_diff']-mitigated_metrics['equal_opportunity_diff']:.4f}")
-
-    # Count metrics where mitigated model is better
-    better_count = 0
-    fairness_keys = ['demographic_parity_diff', 'equal_opportunity_diff', 'equalized_odds_diff']
-    for key in fairness_keys:
-        if mitigated_metrics[key] < baseline_metrics[key]:
-            better_count += 1
-
-    print(f"\nFairness metrics improved: {better_count}/3")
-
-    # Save results
-    plot_comparison(baseline_metrics, mitigated_metrics)
-    save_results_to_csv(baseline_metrics, mitigated_metrics)
-
-    print("\n" + "="*70)
-    print("Analysis complete! Check results_comparison.png and results_metrics.csv")
-    print("="*70)
 
 
 if __name__ == "__main__":
