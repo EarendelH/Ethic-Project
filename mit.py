@@ -1,40 +1,37 @@
 """
-CS340 Final Project - Bias Mitigation
+CS340 Final Project - Bias Mitigation v3
+
 Strategy:
-  1. Pre-processing : class-aware sample reweighting (boost Female weight)
-  2. Train-time     : Adversarial debiasing - an auxiliary head tries to predict SEX
-                      from the shared representation; the shared encoder is trained
-                      to fool it (gradient reversal), making representations gender-neutral.
-  3. Architecture   : Deeper / normalised backbone + dropout for better generalisation
-  4. Post-processing: Per-group threshold calibration to equalise FNR across SEX groups
+  1. Pre-processing : group + label reweighting
+  2. Train-time A   : adversarial debiasing (GRL)
+  3. Train-time B   : FNR-gap penalty in main loss
+  4. Custom GradientTape training loop — avoids all Keras sample_weight shape
+     restrictions; gives full control over what each head receives.
+  5. No post-processing threshold shifts
 """
 
-import os
-import random
-
+import os, random
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 import tensorflow_model_analysis as tfma
 from google.protobuf import text_format
 
-# ── Global config ──────────────────────────────────────────────────────────────
 RANDOM_STATE = 200
 BATCH_SIZE   = 256
-EPOCHS       = 20
+EPOCHS       = 25
 
 LABEL_KEY               = "EMPLOYED"
 SENSITIVE_ATTRIBUTE_KEY = "SEX"
-BANNED_FEATURES         = ["RELP"]          # SEX kept for adversarial loss during training
+BANNED_FEATURES         = ["RELP"]
 SENSITIVE_ATTRIBUTE_VALUES = {1.0: "Male", 2.0: "Female"}
 PREDICTION_KEY          = "PRED"
 
-# Adversarial loss weight  (λ) — how hard we push gender-neutrality
-ADV_LAMBDA = 0.5
+ADV_LAMBDA  = 0.6   # adversarial head loss weight
+FAIR_LAMBDA = 1.5   # FNR-gap penalty weight
 
 
-# ── Reproducibility ────────────────────────────────────────────────────────────
-def set_seeds(seed: int) -> None:
+def set_seeds(seed):
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -45,347 +42,282 @@ def set_seeds(seed: int) -> None:
         pass
 
 
-# ── TFMA helpers ───────────────────────────────────────────────────────────────
-def _format_slice_name(slice_name):
-    if slice_name == ():
-        return "Overall"
-    return ", ".join(f"{k}={v}" for k, v in slice_name)
+def _fmt_slice(s):
+    return "Overall" if s == () else ", ".join(f"{k}={v}" for k, v in s)
 
+def _fmt_val(v):
+    if isinstance(v, dict):
+        if "doubleValue" in v: return f"{v['doubleValue']:.4f}"
+        if "boundedValue" in v: return f"{v['boundedValue'].get('value', 0):.4f}"
+    return f"{v:.4f}" if isinstance(v, float) else str(v)
 
-def _format_tfma_value(value):
-    if isinstance(value, dict):
-        if "doubleValue" in value:
-            return f"{value['doubleValue']:.4f}"
-        if "boundedValue" in value:
-            b = value["boundedValue"]
-            return f"{b.get('value', 0):.4f} [{b.get('lowerBound', 0):.4f}, {b.get('upperBound', 0):.4f}]"
-        return str(value)
-    if isinstance(value, float):
-        return f"{value:.4f}"
-    return str(value)
-
-
-def print_tfma_text_summary(eval_result, title):
+def print_tfma(result, title):
     print(f"\nTFMA Text Summary: {title}")
-    metrics_by_slice = eval_result.get_metrics_for_all_slices()
-    for slice_name in sorted(metrics_by_slice.keys(), key=str):
-        print(f"\nSlice: {_format_slice_name(slice_name)}")
-        for metric_name in sorted(metrics_by_slice[slice_name].keys()):
-            print(f"  {metric_name}: {_format_tfma_value(metrics_by_slice[slice_name][metric_name])}")
+    for sname in sorted(result.get_metrics_for_all_slices().keys(), key=str):
+        print(f"\nSlice: {_fmt_slice(sname)}")
+        m = result.get_metrics_for_all_slices()[sname]
+        for mn in sorted(m.keys()):
+            print(f"  {mn}: {_fmt_val(m[mn])}")
 
 
 # ── Gradient Reversal Layer ────────────────────────────────────────────────────
 @tf.custom_gradient
-def _gradient_reversal_op(x, lam):
-    def grad(dy):
-        return -lam * dy, None
+def _grl_op(x, lam):
+    def grad(dy): return -lam * dy, None
     return x, grad
 
-
-class GradientReversalLayer(tf.keras.layers.Layer):
-    """Multiplies the gradient by -λ during back-prop (Ganin et al., 2015)."""
-    def __init__(self, lam: float = 1.0, **kwargs):
-        super().__init__(**kwargs)
-        self.lam = tf.Variable(lam, trainable=False, dtype=tf.float32, name="grl_lambda")
-
+class GRL(tf.keras.layers.Layer):
+    def __init__(self, lam=1.0, **kw):
+        super().__init__(**kw)
+        self.lam = tf.Variable(float(lam), trainable=False, dtype=tf.float32)
     def call(self, x):
-        return _gradient_reversal_op(tf.cast(x, tf.float32), self.lam)
-
+        return _grl_op(tf.cast(x, tf.float32), self.lam)
     def get_config(self):
-        cfg = super().get_config()
-        cfg["lam"] = float(self.lam.numpy())
-        return cfg
+        return {**super().get_config(), "lam": float(self.lam.numpy())}
 
 
-# ── Model ──────────────────────────────────────────────────────────────────────
-def build_adversarial_model(
-    feature_df: pd.DataFrame,
-    model_feature_cols: list,
-    adv_lambda: float = ADV_LAMBDA,
-) -> tf.keras.Model:
-    """
-    Two-headed model:
-      • main_output  — predicts EMPLOYED  (sigmoid)
-      • adv_output   — predicts SEX       (sigmoid, with GRL)
+# ── Model (build only, no compile) ────────────────────────────────────────────
+def build_model(train_df, encoder_cols):
+    inputs = {c: tf.keras.Input(shape=(1,), name=c, dtype=tf.float64)
+              for c in encoder_cols}
 
-    The GRL ensures the shared encoder learns gender-neutral features.
-    """
-    inputs = {
-        name: tf.keras.Input(shape=(1,), name=name, dtype=tf.float64)
-        for name in model_feature_cols
-    }
-
-    def stack_dict(d):
+    def stack(d):
         return tf.concat(
             [tf.cast(d[k], tf.float64) for k in sorted(d.keys())], axis=-1
         )
 
-    x = stack_dict(inputs)
+    x = stack(inputs)
 
-    # Normalisation fitted on training features only
-    normalizer = tf.keras.layers.Normalization(axis=-1)
-    normalizer.adapt(feature_df[model_feature_cols].values)
-    x = normalizer(x)
-
-    # ── Shared encoder ──
-    x = tf.keras.layers.Dense(64, use_bias=False)(x)
-    x = tf.keras.layers.BatchNormalization()(x)
-    x = tf.keras.layers.Activation("relu")(x)
-    x = tf.keras.layers.Dropout(0.3)(x)
+    norm = tf.keras.layers.Normalization(axis=-1)
+    norm.adapt(train_df[encoder_cols].values)
+    x = norm(x)
 
     x = tf.keras.layers.Dense(64, use_bias=False)(x)
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.Activation("relu")(x)
-    x = tf.keras.layers.Dropout(0.3)(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
 
-    x = tf.keras.layers.Dense(32, use_bias=False)(x)
+    x = tf.keras.layers.Dense(64, use_bias=False)(x)
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.Activation("relu")(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
 
-    # ── Main classification head ──
-    main_output = tf.keras.layers.Dense(1, activation="sigmoid", name="main_output")(x)
+    x = tf.keras.layers.Dense(32, activation="relu")(x)
 
-    # ── Adversarial head (GRL) ──
-    x_adv = GradientReversalLayer(lam=adv_lambda, name="grl")(x)
+    main_out = tf.keras.layers.Dense(1, activation="sigmoid", name="main_output")(x)
+
+    x_adv = GRL(lam=ADV_LAMBDA, name="grl")(x)
     x_adv = tf.keras.layers.Dense(16, activation="relu")(x_adv)
-    adv_output = tf.keras.layers.Dense(1, activation="sigmoid", name="adv_output")(x_adv)
+    adv_out = tf.keras.layers.Dense(1, activation="sigmoid", name="adv_output")(x_adv)
 
-    return tf.keras.Model(inputs=inputs, outputs=[main_output, adv_output])
+    return tf.keras.Model(inputs, [main_out, adv_out])
 
 
-# ── Dataset helpers ────────────────────────────────────────────────────────────
-def make_adversarial_dataset(df: pd.DataFrame, feature_cols: list) -> tf.data.Dataset:
-    """
-    Returns a dataset of ({features}, {main_label, adv_label}).
-    adv_label = 0 for Male (SEX==1), 1 for Female (SEX==2).
-    """
-    features = {col: df[col].values for col in feature_cols}
-    main_labels = df[LABEL_KEY].values.astype(np.float32)
-    adv_labels  = (df[SENSITIVE_ATTRIBUTE_KEY].values == 2.0).astype(np.float32)
-    return tf.data.Dataset.from_tensor_slices(
-        (features, {"main_output": main_labels, "adv_output": adv_labels})
+# ── Loss functions (plain functions, not Keras Loss objects) ───────────────────
+bce_fn = tf.keras.losses.BinaryCrossentropy(reduction="none")
+
+def main_loss(y_true, y_pred, is_female, sample_weight):
+    """BCE weighted by sample_weight + FAIR_LAMBDA * soft-FNR gap."""
+    y_true   = tf.cast(tf.reshape(y_true,   [-1]), tf.float32)
+    y_pred   = tf.cast(tf.reshape(y_pred,   [-1]), tf.float32)
+    is_fem   = tf.cast(tf.reshape(is_female, [-1]), tf.float32)
+    sw       = tf.cast(tf.reshape(sample_weight, [-1]), tf.float32)
+
+    # Weighted BCE
+    per_sample_bce = -(
+        y_true       * tf.math.log(y_pred + 1e-7) +
+        (1 - y_true) * tf.math.log(1 - y_pred + 1e-7)
+    )
+    weighted_bce = tf.reduce_sum(sw * per_sample_bce) / (tf.reduce_sum(sw) + 1e-7)
+
+    # Soft FNR per group: mean(1-p | y=1, group=g)
+    pos     = tf.cast(y_true > 0.5, tf.float32)
+    eps     = 1e-6
+    fem_pos = pos * is_fem
+    mal_pos = pos * (1.0 - is_fem)
+
+    fnr_fem = tf.reduce_sum((1.0 - y_pred) * fem_pos) / (tf.reduce_sum(fem_pos) + eps)
+    fnr_mal = tf.reduce_sum((1.0 - y_pred) * mal_pos) / (tf.reduce_sum(mal_pos) + eps)
+
+    gap = tf.abs(fnr_fem - fnr_mal)
+
+    return weighted_bce + FAIR_LAMBDA * gap
+
+def adv_loss(is_female, adv_pred):
+    """Standard BCE for the adversarial head."""
+    return tf.reduce_mean(
+        bce_fn(tf.reshape(is_female, [-1, 1]),
+               tf.reshape(adv_pred, [-1, 1]))
     )
 
 
-# ── Sample weights: boost Female, balance positive/negative per group ──────────
-def compute_sample_weights(df: pd.DataFrame) -> np.ndarray:
-    """
-    Two-level reweighting:
-      1. Equalise group sizes  (Male / Female)
-      2. Equalise positive-rate within each group
-    """
-    weights = np.ones(len(df), dtype=np.float32)
+# ── Dataset ────────────────────────────────────────────────────────────────────
+def compute_weights(df):
+    w = np.ones(len(df), dtype=np.float32)
+    fem = df[SENSITIVE_ATTRIBUTE_KEY] == 2.0
+    mal = ~fem
+    n   = len(df)
+    w[fem] = n / (2.0 * fem.sum())
+    w[mal] = n / (2.0 * mal.sum())
+    for mask in [fem, mal]:
+        pos = (df[LABEL_KEY] == 1) & mask
+        neg = (df[LABEL_KEY] == 0) & mask
+        np_, nn = pos.sum(), neg.sum()
+        if np_ > 0 and nn > 0:
+            w[pos] *= (np_ + nn) / (2.0 * np_)
+            w[neg] *= (np_ + nn) / (2.0 * nn)
+    w /= w.mean()
+    return w
 
-    female_mask = df[SENSITIVE_ATTRIBUTE_KEY] == 2.0
-    male_mask   = ~female_mask
-
-    n_female = female_mask.sum()
-    n_male   = male_mask.sum()
-    n_total  = len(df)
-
-    # Group-level weight
-    w_female = n_total / (2.0 * n_female)
-    w_male   = n_total / (2.0 * n_male)
-
-    weights[female_mask] = w_female
-    weights[male_mask]   = w_male
-
-    # Within-group label balance
-    for mask, label_col in [(female_mask, LABEL_KEY), (male_mask, LABEL_KEY)]:
-        pos = (df[label_col] == 1) & mask
-        neg = (df[label_col] == 0) & mask
-        n_pos = pos.sum()
-        n_neg = neg.sum()
-        if n_pos > 0 and n_neg > 0:
-            w_pos = (n_pos + n_neg) / (2.0 * n_pos)
-            w_neg = (n_pos + n_neg) / (2.0 * n_neg)
-            weights[pos] *= w_pos
-            weights[neg] *= w_neg
-
-    # Normalise so mean weight == 1
-    weights /= weights.mean()
-    return weights
+def make_ds(df, encoder_cols, sample_weights=None):
+    """Each element: (feature_dict, label, is_female, sample_weight)"""
+    feats  = {c: df[c].values for c in encoder_cols}
+    label  = df[LABEL_KEY].values.astype(np.float32)
+    is_fem = (df[SENSITIVE_ATTRIBUTE_KEY].values == 2.0).astype(np.float32)
+    if sample_weights is None:
+        sample_weights = np.ones(len(df), dtype=np.float32)
+    return tf.data.Dataset.from_tensor_slices((feats, label, is_fem, sample_weights))
 
 
-# ── Per-group threshold calibration ───────────────────────────────────────────
-def calibrate_thresholds(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    group: np.ndarray,
-    target_metric: str = "fnr",
-) -> dict:
-    """
-    Find per-group thresholds that equalise FNR across groups.
-    Returns {group_value: threshold}.
-    """
-    unique_groups = np.unique(group)
-    fnrs   = {}
-    thresholds = {}
+# ── Custom training loop ───────────────────────────────────────────────────────
+@tf.function
+def train_step(model, optimizer, x_batch, y_batch, fem_batch, sw_batch,
+               train_loss_tracker, train_auc):
+    with tf.GradientTape() as tape:
+        main_pred, adv_pred = model(x_batch, training=True)
+        loss_main = main_loss(y_batch, main_pred, fem_batch, sw_batch)
+        loss_adv  = adv_loss(fem_batch, adv_pred)
+        total     = loss_main + ADV_LAMBDA * loss_adv
+    grads = tape.gradient(total, model.trainable_variables)
+    optimizer.apply_gradients(zip(grads, model.trainable_variables))
+    train_loss_tracker.update_state(total)
+    train_auc.update_state(tf.reshape(y_batch, [-1, 1]),
+                           tf.reshape(main_pred, [-1, 1]))
+    return total
 
-    # For each group find threshold minimising |FNR - overall_FNR|
-    # First compute the overall FNR at t=0.5
-    overall_fnr = 1.0 - (((y_pred >= 0.5) & (y_true == 1)).sum() / max((y_true == 1).sum(), 1))
-
-    for g in unique_groups:
-        mask = group == g
-        yt, yp = y_true[mask], y_pred[mask]
-        best_t, best_diff = 0.5, 1e9
-        for t in np.linspace(0.2, 0.8, 121):
-            fnr = 1.0 - (((yp >= t) & (yt == 1)).sum() / max((yt == 1).sum(), 1))
-            diff = abs(fnr - overall_fnr)
-            if diff < best_diff:
-                best_diff, best_t = diff, t
-        thresholds[g] = best_t
-        fnrs[g] = best_t
-
-    print(f"  Calibrated thresholds: {thresholds}")
-    return thresholds
+@tf.function
+def val_step(model, x_batch, y_batch, fem_batch, sw_batch,
+             val_loss_tracker, val_auc):
+    main_pred, adv_pred = model(x_batch, training=False)
+    loss_main = main_loss(y_batch, main_pred, fem_batch, sw_batch)
+    loss_adv  = adv_loss(fem_batch, adv_pred)
+    total     = loss_main + ADV_LAMBDA * loss_adv
+    val_loss_tracker.update_state(total)
+    val_auc.update_state(tf.reshape(y_batch, [-1, 1]),
+                         tf.reshape(main_pred, [-1, 1]))
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
-def main() -> None:
+def main():
     set_seeds(RANDOM_STATE)
 
-    # ── Load data ──
     acs_df = pd.read_csv("acsemployment_2018_ca_tx.csv")
     acs_df[LABEL_KEY] = acs_df[LABEL_KEY].astype(int)
 
-    # ── Train / test split ──
-    acs_train_df = acs_df.sample(frac=0.8, random_state=RANDOM_STATE).reset_index(drop=True)
-    acs_test_df  = acs_df.drop(acs_train_df.index).sample(frac=1.0, random_state=RANDOM_STATE).reset_index(drop=True)
+    train_df = acs_df.sample(frac=0.8, random_state=RANDOM_STATE).reset_index(drop=True)
+    test_df  = acs_df.drop(train_df.index).sample(frac=1.0, random_state=RANDOM_STATE).reset_index(drop=True)
 
-    # Model features = all columns except label and RELP (SEX kept for adversarial)
-    model_feature_cols = [c for c in acs_df.columns if c not in [LABEL_KEY] + BANNED_FEATURES]
-    # Features fed to the encoder (exclude SEX from encoder input → only used in adv head label)
-    encoder_feature_cols = [c for c in model_feature_cols if c != SENSITIVE_ATTRIBUTE_KEY]
+    encoder_cols = [c for c in acs_df.columns
+                    if c not in [LABEL_KEY] + BANNED_FEATURES + [SENSITIVE_ATTRIBUTE_KEY]]
+    print(f"Encoder features ({len(encoder_cols)}): {encoder_cols}")
 
-    print(f"Encoder features ({len(encoder_feature_cols)}): {encoder_feature_cols}")
+    sw = compute_weights(train_df)
 
-    # ── Sample weights ──
-    sample_weights = compute_sample_weights(acs_train_df)
-
-    # ── Datasets ──
     train_ds = (
-        make_adversarial_dataset(acs_train_df, encoder_feature_cols)
+        make_ds(train_df, encoder_cols, sample_weights=sw)
         .shuffle(10_000, seed=RANDOM_STATE)
         .batch(BATCH_SIZE)
     )
-    # Attach sample weights
-    sw_ds = tf.data.Dataset.from_tensor_slices(sample_weights).batch(BATCH_SIZE)
-    train_ds_weighted = tf.data.Dataset.zip((train_ds, sw_ds)).map(
-        lambda xy, w: (xy[0], xy[1], w)
-    )
+    val_ds = make_ds(test_df, encoder_cols).batch(BATCH_SIZE)
 
-    test_ds = (
-        make_adversarial_dataset(acs_test_df, encoder_feature_cols)
-        .batch(BATCH_SIZE)
-    )
+    model     = build_model(train_df, encoder_cols)
+    optimizer = tf.keras.optimizers.Adam(1e-3)
 
-    # ── Build & compile model ──
-    model = build_adversarial_model(acs_train_df, encoder_feature_cols)
+    # Metrics
+    train_loss = tf.keras.metrics.Mean(name="train_loss")
+    train_auc  = tf.keras.metrics.AUC(name="train_auc")
+    val_loss   = tf.keras.metrics.Mean(name="val_loss")
+    val_auc    = tf.keras.metrics.AUC(name="val_auc")
 
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss={
-            "main_output": tf.keras.losses.BinaryCrossentropy(),
-            "adv_output" : tf.keras.losses.BinaryCrossentropy(),
-        },
-        loss_weights={
-            "main_output": 1.0,
-            "adv_output" : ADV_LAMBDA,
-        },
-        metrics={
-            "main_output": [
-                tf.keras.metrics.BinaryAccuracy(name="accuracy"),
-                tf.keras.metrics.AUC(name="auc"),
-            ],
-            "adv_output": [tf.keras.metrics.BinaryAccuracy(name="adv_accuracy")],
-        },
-    )
+    best_val_auc   = 0.0
+    patience_count = 0
+    PATIENCE       = 7
+    best_weights   = None
 
-    model.summary()
+    print("\n── Training v3 ──")
+    for epoch in range(1, EPOCHS + 1):
+        train_loss.reset_state(); train_auc.reset_state()
+        val_loss.reset_state();   val_auc.reset_state()
 
-    # ── Learning rate schedule ──
-    lr_cb = tf.keras.callbacks.ReduceLROnPlateau(
-        monitor="val_main_output_auc", factor=0.5, patience=3,
-        min_lr=1e-5, verbose=1, mode="max"
-    )
-    es_cb = tf.keras.callbacks.EarlyStopping(
-        monitor="val_main_output_auc", patience=5,
-        restore_best_weights=True, verbose=1, mode="max"
-    )
+        for x_b, y_b, fem_b, sw_b in train_ds:
+            train_step(model, optimizer, x_b, y_b, fem_b, sw_b,
+                       train_loss, train_auc)
 
-    # ── Training with sample weights ──
-    # tf.data with sample_weight: we use a custom train loop for clarity
-    print("\n── Training adversarial debiasing model ──")
-    history = model.fit(
-        train_ds_weighted,
-        validation_data=test_ds,
-        epochs=EPOCHS,
-        callbacks=[lr_cb, es_cb],
-    )
+        for x_b, y_b, fem_b, sw_b in val_ds:
+            val_step(model, x_b, y_b, fem_b, sw_b, val_loss, val_auc)
 
-    # ── Predict (only main_output used) ──
-    test_features_ds = tf.data.Dataset.from_tensor_slices(
-        {col: acs_test_df[col].values for col in encoder_feature_cols}
+        tl = float(train_loss.result()); ta = float(train_auc.result())
+        vl = float(val_loss.result());   va = float(val_auc.result())
+        print(f"Epoch {epoch:02d}/{EPOCHS}  "
+              f"loss={tl:.4f} auc={ta:.4f}  "
+              f"val_loss={vl:.4f} val_auc={va:.4f}")
+
+        # LR reduction
+        if epoch > 1 and epoch % 4 == 0:
+            old_lr = float(optimizer.learning_rate)
+            if va <= best_val_auc:
+                new_lr = max(old_lr * 0.5, 1e-6)
+                optimizer.learning_rate.assign(new_lr)
+                if new_lr != old_lr:
+                    print(f"  LR {old_lr:.2e} → {new_lr:.2e}")
+
+        # Early stopping
+        if va > best_val_auc + 1e-4:
+            best_val_auc   = va
+            patience_count = 0
+            best_weights   = model.get_weights()
+        else:
+            patience_count += 1
+            if patience_count >= PATIENCE:
+                print(f"Early stopping at epoch {epoch} (best val_auc={best_val_auc:.4f})")
+                break
+
+    if best_weights is not None:
+        model.set_weights(best_weights)
+        print(f"Restored best weights (val_auc={best_val_auc:.4f})")
+
+    # ── Predict ──
+    pred_ds = tf.data.Dataset.from_tensor_slices(
+        {c: test_df[c].values for c in encoder_cols}
     ).batch(BATCH_SIZE)
+    preds, _ = model.predict(pred_ds)
+    preds = preds.flatten()
 
-    main_preds, adv_preds = model.predict(test_features_ds, batch_size=BATCH_SIZE)
-    main_preds = main_preds.flatten()
-
-    # ── Post-processing: threshold calibration ──
-    y_true  = acs_test_df[LABEL_KEY].values
-    sex_arr = acs_test_df[SENSITIVE_ATTRIBUTE_KEY].values
-
-    print("\nCalibrating per-group thresholds …")
-    thresholds = calibrate_thresholds(y_true, main_preds, sex_arr)
-
-    # Apply calibrated thresholds → final binary predictions used for soft scores
-    # (TFMA uses continuous scores, so we keep the raw probabilities but can
-    #  shift them so that applying t=0.5 matches our calibrated thresholds)
-    calibrated_preds = main_preds.copy()
-    for g, t in thresholds.items():
-        mask = sex_arr == g
-        if t != 0.5:
-            # Linear rescale: map [0, t] → [0, 0.5], [t, 1] → [0.5, 1]
-            p = main_preds[mask]
-            shifted = np.where(
-                p < t,
-                p * 0.5 / t,
-                0.5 + (p - t) * 0.5 / (1.0 - t + 1e-9),
-            )
-            calibrated_preds[mask] = np.clip(shifted, 0.0, 1.0)
-
-    # ── TFMA evaluation ──
-    analysis_df = acs_test_df.copy()
-    analysis_df[SENSITIVE_ATTRIBUTE_KEY] = analysis_df[SENSITIVE_ATTRIBUTE_KEY].replace(
-        SENSITIVE_ATTRIBUTE_VALUES
+    # ── TFMA ──
+    analysis_df = test_df.copy()
+    analysis_df[SENSITIVE_ATTRIBUTE_KEY] = (
+        analysis_df[SENSITIVE_ATTRIBUTE_KEY].replace(SENSITIVE_ATTRIBUTE_VALUES)
     )
-    analysis_df[PREDICTION_KEY] = calibrated_preds
+    analysis_df[PREDICTION_KEY] = preds
 
-    eval_config_pbtxt = """
-      model_specs {
-        prediction_key: "%s"
-        label_key: "%s"
-      }
+    cfg_pbtxt = """
+      model_specs { prediction_key: "%s" label_key: "%s" }
       metrics_specs {
         metrics { class_name: "ExampleCount" }
         metrics { class_name: "BinaryAccuracy" }
         metrics { class_name: "AUC" }
         metrics { class_name: "ConfusionMatrixPlot" }
-        metrics {
-          class_name: "FairnessIndicators"
-          config: '{"thresholds": [0.50]}'
-        }
+        metrics { class_name: "FairnessIndicators"
+                  config: '{"thresholds": [0.50]}' }
       }
       slicing_specs { feature_keys: "%s" }
       slicing_specs {}
     """ % (PREDICTION_KEY, LABEL_KEY, SENSITIVE_ATTRIBUTE_KEY)
 
-    eval_config = text_format.Parse(eval_config_pbtxt, tfma.EvalConfig())
-    eval_result = tfma.analyze_raw_data(analysis_df, eval_config)
-
-    print_tfma_text_summary(eval_result, "Mitigated Model")
+    result = tfma.analyze_raw_data(
+        analysis_df, text_format.Parse(cfg_pbtxt, tfma.EvalConfig())
+    )
+    print_tfma(result, "Mitigated Model v3")
 
 
 if __name__ == "__main__":
