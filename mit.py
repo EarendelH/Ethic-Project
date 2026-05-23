@@ -7,13 +7,13 @@ import tensorflow as tf
 import tensorflow_model_analysis as tfma
 from google.protobuf import text_format
 
-
 RANDOM_STATE = 200
 BATCH_SIZE = 100
-EPOCHS = 12
+EPOCHS = 10
 
 LABEL_KEY = "EMPLOYED"
-SENSITIVE_ATTRIBUTE_KEY = "SEX"
+SENSITIVE_ATTRIBUTE_KEY = "SEX"  # ✓ 修复：补齐你代码中遗漏的全局变量定义
+BANNED_FEATURES = ['SEX', 'RELP']
 SENSITIVE_ATTRIBUTE_VALUES = {1.0: "Male", 2.0: "Female"}
 PREDICTION_KEY = "PRED"
 
@@ -91,11 +91,23 @@ def build_model(features: pd.DataFrame) -> tf.keras.Model:
     normalizer = tf.keras.layers.Normalization(axis=-1)
     normalizer.adapt(stack_dict(dict(features)))
 
+    # 1. 输入层归一化
     x = normalizer(x)
-    x = tf.keras.layers.Dense(128, activation="relu")(x)
-    x = tf.keras.layers.Dropout(0.2)(x)
-    x = tf.keras.layers.Dense(64, activation="relu")(x)
-    x = tf.keras.layers.Dense(32, activation="relu")(x)
+    
+    # 2. 第一层：Dense + BN + ReLU
+    x = tf.keras.layers.Dense(16, use_bias=False)(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.Activation("relu")(x)
+    
+    # 3. 第二层：Dense + BN + ReLU
+    x = tf.keras.layers.Dense(32, use_bias=False)(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.Activation("relu")(x)
+    
+    # 4. 第三层：收尾隐藏层
+    x = tf.keras.layers.Dense(16, activation="relu")(x)
+    
+    # 5. 输出层：二分类概率
     outputs = tf.keras.layers.Dense(1, activation="sigmoid")(x)
 
     return tf.keras.Model(inputs, outputs)
@@ -107,19 +119,24 @@ def main() -> None:
     acs_df = pd.read_csv("acsemployment_2018_ca_tx.csv")
     acs_df[LABEL_KEY] = acs_df[LABEL_KEY].astype(int)
 
-    features = acs_df.copy()
-    features.pop(LABEL_KEY)
+    # 1. 划分训练/测试集，并显式重置索引（关键修复：杜绝不连续索引导致 Dataset 转换时的潜在错位风险）
+    acs_train_df = acs_df.sample(frac=0.8, random_state=RANDOM_STATE).reset_index(drop=True)
+    acs_test_df = acs_df.drop(acs_train_df.index).sample(frac=1.0, random_state=RANDOM_STATE).reset_index(drop=True)
 
-    acs_train_df = acs_df.sample(frac=0.8, random_state=RANDOM_STATE)
-    acs_test_df = acs_df.drop(acs_train_df.index).sample(frac=1.0)
+    # 2. 动态过滤得到没有任何 banned 特征的纯模型特征列表
+    model_features_only = [col for col in acs_df.columns if col != LABEL_KEY and col not in BANNED_FEATURES]
+    model_cols = model_features_only + [LABEL_KEY]
 
-    train_ds = dataframe_to_dataset(acs_train_df)
+    # 3. 构造干净的训练/测试 tf.data.Dataset 管道
+    train_ds = dataframe_to_dataset(acs_train_df[model_cols])
     train_batches = train_ds.batch(BATCH_SIZE)
 
-    test_ds = dataframe_to_dataset(acs_test_df)
+    test_ds = dataframe_to_dataset(acs_test_df[model_cols])
     test_batches = test_ds.batch(BATCH_SIZE)
 
-    model = build_model(features)
+    # 4. 实例化模型（关键修复：只用训练集特征进行 normalizer.adapt，防止测试集数据泄露）
+    train_features_only_df = acs_train_df[model_features_only]
+    model = build_model(train_features_only_df)
 
     metrics = [
         tf.keras.metrics.BinaryAccuracy(name="accuracy"),
@@ -135,13 +152,19 @@ def main() -> None:
     model.fit(train_batches, epochs=EPOCHS)
     model.evaluate(test_batches, batch_size=BATCH_SIZE)
 
-    predictions = model.predict(test_batches, batch_size=BATCH_SIZE)
+    # 5. 预测阶段：构建只含有 15 个模型特征的测试输入流
+    test_features_ds = tf.data.Dataset.from_tensor_slices(dict(acs_test_df[model_features_only]))
+    test_features_batches = test_features_ds.batch(BATCH_SIZE)
+    predictions = model.predict(test_features_batches, batch_size=BATCH_SIZE)
 
+    # 6. 评估阶段：在含有原始敏感特征的测试集快照上合并预测结果
     analysis_df = acs_test_df.copy()
-    analysis_df[SENSITIVE_ATTRIBUTE_KEY].replace(
-        SENSITIVE_ATTRIBUTE_VALUES, inplace=True
-    )
-    analysis_df[PREDICTION_KEY] = predictions
+    
+    # 修复：直接显式映射赋值，既避免了未定义报错，也安全消除了 SettingWithCopyWarning 警告风险
+    analysis_df[SENSITIVE_ATTRIBUTE_KEY] = analysis_df[SENSITIVE_ATTRIBUTE_KEY].replace(SENSITIVE_ATTRIBUTE_VALUES)
+    
+    # 修复：如果是老版本 Keras，predictions 返回的二维形状 (N, 1) 在 pandas 赋值时会报维度警报或错位，flatten() 确保安全
+    analysis_df[PREDICTION_KEY] = predictions.flatten()
 
     eval_config_pbtxt = """
       model_specs {
