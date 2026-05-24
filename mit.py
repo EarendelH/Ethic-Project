@@ -326,8 +326,17 @@ def main():
     acs_df = pd.read_csv("acsemployment_2018_ca_tx.csv")
     acs_df[LABEL_KEY] = acs_df[LABEL_KEY].astype(int)
 
-    train_df = acs_df.sample(frac=0.8, random_state=RANDOM_STATE).reset_index(drop=True)
-    test_df  = acs_df.drop(train_df.index).sample(frac=1.0, random_state=RANDOM_STATE).reset_index(drop=True)
+    #train_df = acs_df.sample(frac=0.8, random_state=RANDOM_STATE).reset_index(drop=True)
+    #test_df  = acs_df.drop(train_df.index).sample(frac=1.0, random_state=RANDOM_STATE).reset_index(drop=True)
+    # 1. 同样带上随机种子抽样，但先不要 reset_index
+    train_df = acs_df.sample(frac=0.8, random_state=RANDOM_STATE)
+    
+    # 2. 此时 train_df.index 还是原始的随机索引，drop 才能正确剔除训练集
+    test_df  = acs_df.drop(train_df.index).sample(frac=1.0, random_state=RANDOM_STATE)
+
+    # 3. 划分完后，如果需要，再各自 reset_index
+    train_df = train_df.reset_index(drop=True)
+    test_df  = test_df.reset_index(drop=True)
 
     encoder_cols = [c for c in acs_df.columns
                     if c not in [LABEL_KEY] + BANNED_FEATURES + [SENSITIVE_ATTRIBUTE_KEY]]
