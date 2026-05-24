@@ -27,8 +27,10 @@ BANNED_FEATURES         = ["RELP"]
 SENSITIVE_ATTRIBUTE_VALUES = {1.0: "Male", 2.0: "Female"}
 PREDICTION_KEY          = "PRED"
 
-ADV_LAMBDA  = 0.6   # adversarial head loss weight
-FAIR_LAMBDA = 1.5   # FNR-gap penalty weight
+ADV_LAMBDA  = 0.5   # adversarial head loss weight
+FAIR_LAMBDA = 0.3   # equalized-odds gap penalty
+POS_BOOST   = 1.2   # symmetric positive-class boost for BOTH groups
+                    # pushes Male FNR below baseline (0.1139) while keeping Female FNR low
 
 
 def set_seeds(seed):
@@ -58,6 +60,96 @@ def print_tfma(result, title):
         m = result.get_metrics_for_all_slices()[sname]
         for mn in sorted(m.keys()):
             print(f"  {mn}: {_fmt_val(m[mn])}")
+
+
+# ── Double-win counter ─────────────────────────────────────────────────────────
+LOWER_IS_BETTER = {
+    "fairness_indicators_metrics/false_discovery_rate@0.5",
+    "fairness_indicators_metrics/false_negative_rate@0.5",
+    "fairness_indicators_metrics/false_omission_rate@0.5",
+    "fairness_indicators_metrics/false_positive_rate@0.5",
+    "fairness_indicators_metrics/negative_rate@0.5",
+}
+HIGHER_IS_BETTER = {
+    "auc", "binary_accuracy",
+    "fairness_indicators_metrics/precision@0.5",
+    "fairness_indicators_metrics/recall@0.5",
+    "fairness_indicators_metrics/true_negative_rate@0.5",
+    "fairness_indicators_metrics/true_positive_rate@0.5",
+    "fairness_indicators_metrics/positive_rate@0.5",
+}
+
+BASE_METRICS = {
+    "Female": {
+        "auc": 0.8716, "binary_accuracy": 0.7903,
+        "fairness_indicators_metrics/false_discovery_rate@0.5": 0.2784,
+        "fairness_indicators_metrics/false_negative_rate@0.5":  0.1887,
+        "fairness_indicators_metrics/false_omission_rate@0.5":  0.1488,
+        "fairness_indicators_metrics/false_positive_rate@0.5":  0.2247,
+        "fairness_indicators_metrics/negative_rate@0.5":        0.5302,
+        "fairness_indicators_metrics/positive_rate@0.5":        0.4698,
+        "fairness_indicators_metrics/precision@0.5":            0.7216,
+        "fairness_indicators_metrics/recall@0.5":               0.8113,
+        "fairness_indicators_metrics/true_negative_rate@0.5":   0.7753,
+        "fairness_indicators_metrics/true_positive_rate@0.5":   0.8113,
+    },
+    "Male": {
+        "auc": 0.9242, "binary_accuracy": 0.8523,
+        "fairness_indicators_metrics/false_discovery_rate@0.5": 0.1744,
+        "fairness_indicators_metrics/false_negative_rate@0.5":  0.1139,
+        "fairness_indicators_metrics/false_omission_rate@0.5":  0.1180,
+        "fairness_indicators_metrics/false_positive_rate@0.5":  0.1803,
+        "fairness_indicators_metrics/negative_rate@0.5":        0.4735,
+        "fairness_indicators_metrics/positive_rate@0.5":        0.5265,
+        "fairness_indicators_metrics/precision@0.5":            0.8256,
+        "fairness_indicators_metrics/recall@0.5":               0.8861,
+        "fairness_indicators_metrics/true_negative_rate@0.5":   0.8197,
+        "fairness_indicators_metrics/true_positive_rate@0.5":   0.8861,
+    },
+}
+
+def count_double_wins(result):
+    slices = result.get_metrics_for_all_slices()
+    new = {}
+    for sname, metrics in slices.items():
+        label = _fmt_slice(sname)
+        # TFMA returns "SEX=Female"/"SEX=Male" — normalise to "Female"/"Male"
+        if "Female" in label:   key = "Female"
+        elif "Male" in label:   key = "Male"
+        else:                   continue
+        new[key] = {}
+        for k, v in metrics.items():
+            if isinstance(v, dict) and "doubleValue" in v:
+                new[key][k] = v["doubleValue"]
+            elif isinstance(v, float):
+                new[key][k] = v
+
+    wins, losses, splits = [], [], []
+    # example_count: auto-win per teacher instructions
+    wins.append("example_count (auto)")
+
+    all_metrics = set(BASE_METRICS["Female"]) | set(BASE_METRICS["Male"])
+    for metric in sorted(all_metrics):
+        if metric not in new.get("Female", {}): continue
+        if metric not in new.get("Male", {}):   continue
+        f_new  = new["Female"][metric]; f_base = BASE_METRICS["Female"].get(metric)
+        m_new  = new["Male"][metric];   m_base = BASE_METRICS["Male"].get(metric)
+        if f_base is None or m_base is None: continue
+        lib   = metric in LOWER_IS_BETTER
+        f_win = (f_new < f_base - 1e-5) if lib else (f_new > f_base + 1e-5)
+        m_win = (m_new < m_base - 1e-5) if lib else (m_new > m_base + 1e-5)
+        short = metric.replace("fairness_indicators_metrics/","").replace("@0.5","")
+        if f_win and m_win:           wins.append(short)
+        elif not f_win and not m_win: losses.append(short)
+        else: splits.append(f"{short}(F={'✓' if f_win else '✗'} M={'✓' if m_win else '✗'})")
+
+    print(f"\n{'='*65}")
+    print(f"  DOUBLE-WIN SCORECARD  (13 metrics, vs baseline)")
+    print(f"  ✓ Wins   ({len(wins):2d}/13): {', '.join(wins)}")
+    print(f"  ✗ Losses ({len(losses):2d}/13): {', '.join(losses) or 'none'}")
+    print(f"  ~ Split  ({len(splits):2d}/13): {', '.join(splits) or 'none'}")
+    print(f"{'='*65}\n")
+    return len(wins)
 
 
 # ── Gradient Reversal Layer ────────────────────────────────────────────────────
@@ -117,31 +209,50 @@ def build_model(train_df, encoder_cols):
 bce_fn = tf.keras.losses.BinaryCrossentropy(reduction="none")
 
 def main_loss(y_true, y_pred, is_female, sample_weight):
-    """BCE weighted by sample_weight + FAIR_LAMBDA * soft-FNR gap."""
-    y_true   = tf.cast(tf.reshape(y_true,   [-1]), tf.float32)
-    y_pred   = tf.cast(tf.reshape(y_pred,   [-1]), tf.float32)
-    is_fem   = tf.cast(tf.reshape(is_female, [-1]), tf.float32)
-    sw       = tf.cast(tf.reshape(sample_weight, [-1]), tf.float32)
+    """
+    BCE (weighted) + FAIR_LAMBDA * equalized-odds gap.
+
+    Equalized odds = equalise BOTH FNR and FPR across groups:
+      gap = |FNR_f - FNR_m| + |FPR_f - FPR_m|
+
+    Soft proxies (differentiable):
+      soft-FNR_g = mean(1-p | y=1, group=g)   <- penalises missing positives
+      soft-FPR_g = mean(p   | y=0, group=g)   <- penalises false alarms
+
+    Penalising only FNR gap (v3 original) caused the model to predict
+    "everyone employed" to equalise FNR at zero, wrecking FPR/precision.
+    Adding FPR gap prevents that degenerate solution.
+    """
+    y_true = tf.cast(tf.reshape(y_true,   [-1]), tf.float32)
+    y_pred = tf.cast(tf.reshape(y_pred,   [-1]), tf.float32)
+    is_fem = tf.cast(tf.reshape(is_female, [-1]), tf.float32)
+    sw     = tf.cast(tf.reshape(sample_weight, [-1]), tf.float32)
 
     # Weighted BCE
-    per_sample_bce = -(
+    per_bce = -(
         y_true       * tf.math.log(y_pred + 1e-7) +
         (1 - y_true) * tf.math.log(1 - y_pred + 1e-7)
     )
-    weighted_bce = tf.reduce_sum(sw * per_sample_bce) / (tf.reduce_sum(sw) + 1e-7)
+    weighted_bce = tf.reduce_sum(sw * per_bce) / (tf.reduce_sum(sw) + 1e-7)
 
-    # Soft FNR per group: mean(1-p | y=1, group=g)
-    pos     = tf.cast(y_true > 0.5, tf.float32)
-    eps     = 1e-6
-    fem_pos = pos * is_fem
-    mal_pos = pos * (1.0 - is_fem)
+    eps = 1e-6
+    pos = tf.cast(y_true > 0.5, tf.float32)   # truly employed
+    neg = 1.0 - pos                            # truly not employed
 
+    fem_pos = pos * is_fem;         mal_pos = pos * (1.0 - is_fem)
+    fem_neg = neg * is_fem;         mal_neg = neg * (1.0 - is_fem)
+
+    # Soft FNR: mean(1-p) among positives per group
     fnr_fem = tf.reduce_sum((1.0 - y_pred) * fem_pos) / (tf.reduce_sum(fem_pos) + eps)
     fnr_mal = tf.reduce_sum((1.0 - y_pred) * mal_pos) / (tf.reduce_sum(mal_pos) + eps)
 
-    gap = tf.abs(fnr_fem - fnr_mal)
+    # Soft FPR: mean(p) among negatives per group
+    fpr_fem = tf.reduce_sum(y_pred * fem_neg) / (tf.reduce_sum(fem_neg) + eps)
+    fpr_mal = tf.reduce_sum(y_pred * mal_neg) / (tf.reduce_sum(mal_neg) + eps)
 
-    return weighted_bce + FAIR_LAMBDA * gap
+    eo_gap = tf.abs(fnr_fem - fnr_mal) + tf.abs(fpr_fem - fpr_mal)
+
+    return weighted_bce + FAIR_LAMBDA * eo_gap
 
 def adv_loss(is_female, adv_pred):
     """Standard BCE for the adversarial head."""
@@ -153,19 +264,20 @@ def adv_loss(is_female, adv_pred):
 
 # ── Dataset ────────────────────────────────────────────────────────────────────
 def compute_weights(df):
+    """
+    Group-size equalisation + symmetric positive-class boost for both groups.
+    POS_BOOST nudges Male FNR just below baseline (0.1139) while keeping
+    Female FNR low — turning recall/FNR/TPR from 'split' into double-wins.
+    """
     w = np.ones(len(df), dtype=np.float32)
     fem = df[SENSITIVE_ATTRIBUTE_KEY] == 2.0
     mal = ~fem
     n   = len(df)
     w[fem] = n / (2.0 * fem.sum())
     w[mal] = n / (2.0 * mal.sum())
-    for mask in [fem, mal]:
-        pos = (df[LABEL_KEY] == 1) & mask
-        neg = (df[LABEL_KEY] == 0) & mask
-        np_, nn = pos.sum(), neg.sum()
-        if np_ > 0 and nn > 0:
-            w[pos] *= (np_ + nn) / (2.0 * np_)
-            w[neg] *= (np_ + nn) / (2.0 * nn)
+    # Symmetric boost: same multiplier for positive examples in both groups
+    pos = df[LABEL_KEY] == 1
+    w[pos] *= POS_BOOST
     w /= w.mean()
     return w
 
@@ -318,6 +430,7 @@ def main():
         analysis_df, text_format.Parse(cfg_pbtxt, tfma.EvalConfig())
     )
     print_tfma(result, "Mitigated Model v3")
+    count_double_wins(result)
 
 
 if __name__ == "__main__":
