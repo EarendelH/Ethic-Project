@@ -1,0 +1,232 @@
+\documentclass[10pt,aspectratio=169]{beamer}
+
+\usetheme{Madrid}
+\usecolortheme{seahorse}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tikz}
+\usepackage{xcolor}
+
+\definecolor{deepblue}{RGB}{32,82,149}
+\definecolor{softgreen}{RGB}{42,139,93}
+\definecolor{warnorange}{RGB}{194,111,38}
+\definecolor{lightgray}{RGB}{245,247,250}
+
+\title[Bias Mitigation]{Bias Mitigation in ACSEmployment Prediction}
+\subtitle{CS340 Final Project}
+\author{Ziheng Wang \and Peizhou Wu}
+\date{\today}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}{Task and Evaluation Setup}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.52\textwidth}
+      \begin{block}{Prediction Task}
+        \begin{itemize}
+          \item Dataset: ACSEmployment, CA and TX, 2018
+          \item Target: binary employment status
+          \item Sensitive attribute: sex
+          \item Held-out evaluation set: 129,383 individuals
+        \end{itemize}
+      \end{block}
+    \end{column}
+    \begin{column}{0.43\textwidth}
+      \begin{block}{Metric Scope}
+        \begin{itemize}
+          \item 13 TFMA metrics
+          \item 5 extended fairness metrics
+          \item Focus: group-level reliability and error gaps
+        \end{itemize}
+      \end{block}
+    \end{column}
+  \end{columns}
+
+  \vspace{0.5em}
+  \begin{center}
+    \begin{tikzpicture}
+      \fill[deepblue!12] (0,0) rectangle (10.8,0.8);
+      \node[anchor=west,deepblue] at (0.25,0.4) {Goal: reduce gender-related fairness gaps without losing too much predictive utility.};
+    \end{tikzpicture}
+  \end{center}
+\end{frame}
+
+\begin{frame}{Baseline Bias Pattern}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.5\textwidth}
+      \begin{table}
+        \small
+        \begin{tabular}{lcc}
+          \toprule
+          Metric & Female & Male \\
+          \midrule
+          AUC & 0.8713 & 0.9244 \\
+          Precision & 0.7216 & 0.8267 \\
+          Recall / TPR & 0.8059 & 0.8853 \\
+          FPR & 0.2233 & 0.1787 \\
+          FNR & 0.1941 & 0.1147 \\
+          \bottomrule
+        \end{tabular}
+      \end{table}
+    \end{column}
+    \begin{column}{0.46\textwidth}
+      \begin{block}{Observed Gaps}
+        \begin{itemize}
+          \item Predictive parity gap: 0.1051
+          \item AUC gap: 0.0531
+          \item Female group has higher FPR and FNR
+        \end{itemize}
+      \end{block}
+      \begin{alertblock}{Mitigation Target}
+        Improve reliability and error-rate balance rather than only matching positive prediction rates.
+      \end{alertblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{Mitigation Method}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.32\textwidth}
+      \begin{block}{1. Adversarial Debiasing}
+        Gradient reversal discourages gender information in hidden representations.
+      \end{block}
+    \end{column}
+    \begin{column}{0.32\textwidth}
+      \begin{block}{2. Equalized Odds Loss}
+        Directly penalizes FNR and FPR differences across groups.
+      \end{block}
+    \end{column}
+    \begin{column}{0.32\textwidth}
+      \begin{block}{3. Sample Re-weighting}
+        Balances gender groups and boosts positive examples by 1.5x.
+      \end{block}
+    \end{column}
+  \end{columns}
+
+  \vspace{1.0em}
+  \begin{equation*}
+    \mathcal{L}_{main} = \mathcal{L}_{BCE}(y,\hat{y})
+    + \lambda_{fair}\left(|FNR_f-FNR_m| + |FPR_f-FPR_m|\right)
+  \end{equation*}
+  \vspace{-0.4em}
+  \begin{center}
+    $\lambda_{adv}=0.5,\quad \lambda_{fair}=0.5,\quad$ Adam optimizer, 25 epochs
+  \end{center}
+\end{frame}
+
+\begin{frame}{Extended Fairness Metrics Improved}
+  \begin{table}
+    \small
+    \begin{tabular}{lccc}
+      \toprule
+      Metric & Base Model & Fair Model & Direction \\
+      \midrule
+      Disparate Impact Ratio & 0.8886 & 0.9622 & closer to 1 \\
+      Average Odds Difference & 0.0620 & 0.0330 & lower \\
+      Predictive Parity Gap & 0.1051 & 0.0971 & lower \\
+      NPV Equality Gap & 0.0335 & 0.0014 & lower \\
+      AUC Gap & 0.0531 & 0.0378 & lower \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+
+  \vspace{0.8em}
+  \begin{center}
+    \begin{tikzpicture}
+      \fill[softgreen!12] (0,0) rectangle (11.4,0.85);
+      \node[anchor=west,softgreen] at (0.25,0.43) {All five extended fairness metrics move in the desired direction.};
+    \end{tikzpicture}
+  \end{center}
+\end{frame}
+
+\begin{frame}{Performance Trade-off}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.52\textwidth}
+      \begin{table}
+        \small
+        \begin{tabular}{lccc}
+          \toprule
+          Metric & Base & Fair & Change \\
+          \midrule
+          AUC & 0.9016 & 0.8784 & -0.0232 \\
+          Accuracy & 0.8202 & 0.7922 & -0.0280 \\
+          Precision & 0.7763 & 0.7066 & -0.0697 \\
+          Recall / TPR & 0.8481 & 0.9265 & +0.0784 \\
+          FNR & 0.1519 & 0.0735 & -0.0784 \\
+          FPR & 0.2029 & 0.3193 & +0.1164 \\
+          \bottomrule
+        \end{tabular}
+      \end{table}
+    \end{column}
+    \begin{column}{0.44\textwidth}
+      \begin{block}{Interpretation}
+        \begin{itemize}
+          \item The model predicts more positives after mitigation.
+          \item Fewer positive cases are missed.
+          \item More false positives are introduced.
+        \end{itemize}
+      \end{block}
+      \begin{alertblock}{Main Trade-off}
+        Fairness and recall improve, while accuracy, AUC, and precision decrease.
+      \end{alertblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{Overall Experimental Result}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.47\textwidth}
+      \begin{block}{Improved Metrics}
+        \begin{itemize}
+          \item 9 metrics improved in total
+          \item 5 extended fairness metrics improved
+          \item 4 TFMA metrics improved
+        \end{itemize}
+      \end{block}
+    \end{column}
+    \begin{column}{0.49\textwidth}
+      \begin{block}{TFMA Improvements}
+        \begin{itemize}
+          \item Recall
+          \item True positive rate
+          \item False negative rate
+          \item False omission rate
+        \end{itemize}
+      \end{block}
+    \end{column}
+  \end{columns}
+
+  \vspace{0.8em}
+  \begin{center}
+    \begin{tikzpicture}
+      \draw[rounded corners=3pt,fill=lightgray,draw=deepblue!40] (0,0) rectangle (11.8,1.1);
+      \node[text width=11.1cm,align=center] at (5.9,0.55)
+      {The improvement is targeted: fairness gaps and missed-positive errors improve, but predictive ranking and precision costs remain measurable.};
+    \end{tikzpicture}
+  \end{center}
+\end{frame}
+
+\begin{frame}{Conclusion}
+  \begin{itemize}
+    \item Adversarial debiasing, Equalized Odds loss, and sample re-weighting improve all five extended fairness metrics.
+    \item The fair model reduces the AUC gap from 0.0531 to 0.0378 and predictive parity gap from 0.1051 to 0.0971.
+    \item Recall improves from 0.8481 to 0.9265, reducing missed positive cases.
+    \item Accuracy, AUC, precision, and FPR show that fairness gains come with real performance trade-offs.
+  \end{itemize}
+
+  \vfill
+  \begin{center}
+    \Large Questions?
+  \end{center}
+\end{frame}
+
+\end{document}
