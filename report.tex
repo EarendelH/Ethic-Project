@@ -288,6 +288,52 @@ We evaluate the mitigated model using the same 13 TFMA metrics (Table \ref{tab:f
 \end{tabular}
 \end{table}
 
+
+
+
+
+\begin{table}[h]
+\centering
+\caption{Double-Win Scorecard: Fair Model vs.\ Base Model (13 Metrics)}
+\label{tab:double_win_scorecard}
+\begin{tabular}{|l|cc|cc|c|}
+\hline
+\textbf{Metric} &
+\textbf{Base F} & \textbf{Fair F} &
+\textbf{Base M} & \textbf{Fair M} &
+\textbf{Result} \\
+\hline
+\multicolumn{6}{|l|}{\textit{Auto-pass (teacher policy)}} \\
+\hline
+Example Count & 65{,}819 & 66{,}809 & 63{,}564 & 62{,}574 & \textbf{WIN} \\
+\hline
+\multicolumn{6}{|l|}{\textit{Double wins — both groups improve}} \\
+\hline
+False Negative Rate   & 0.1887 & \textbf{0.0814} & 0.1139 & \textbf{0.0666} & \textbf{WIN} \\
+False Omission Rate   & 0.1488 & \textbf{0.0816} & 0.1180 & \textbf{0.0830} & \textbf{WIN} \\
+Negative Rate         & 0.5302 & \textbf{0.4165} & 0.4735 & \textbf{0.3936} & \textbf{WIN} \\
+Positive Rate         & 0.4698 & \textbf{0.5835} & 0.5265 & \textbf{0.6064} & \textbf{WIN} \\
+Recall (TPR)          & 0.8113 & \textbf{0.9186} & 0.8861 & \textbf{0.9334} & \textbf{WIN} \\
+True Positive Rate    & 0.8113 & \textbf{0.9186} & 0.8861 & \textbf{0.9334} & \textbf{WIN} \\
+\hline
+\multicolumn{6}{|l|}{\textit{Double losses — both groups regress}} \\
+\hline
+AUC                   & \textbf{0.8716} & 0.8615 & \textbf{0.9242} & 0.8994 & LOSS \\
+Binary Accuracy       & \textbf{0.7903} & 0.7665 & \textbf{0.8523} & 0.8188 & LOSS \\
+False Discovery Rate  & \textbf{0.2784} & 0.3420 & \textbf{0.1744} & 0.2449 & LOSS \\
+False Positive Rate   & \textbf{0.2247} & 0.3428 & \textbf{0.1803} & 0.2915 & LOSS \\
+Precision             & \textbf{0.7216} & 0.6580 & \textbf{0.8256} & 0.7551 & LOSS \\
+True Negative Rate    & \textbf{0.7753} & 0.6572 & \textbf{0.8197} & 0.7085 & LOSS \\
+\hline
+\multicolumn{4}{|l|}{\textbf{Total Double Wins}} &
+\multicolumn{2}{c|}{\textbf{7 / 13}} \\
+\hline
+\end{tabular}
+
+\end{table}
+
+
+
 \begin{table}[h]
 \centering
 \caption{Extended Fairness Metric Comparison}
@@ -310,7 +356,7 @@ AUC Gap & 0.0531 & 0.0378 & -0.0153 \\
 
 Compared with the baseline, the fair model raises overall recall from 0.8481 to 0.9265 and reduces the false negative rate from 0.1519 to 0.0735. This is important in an employment setting because false negatives correspond to qualified individuals being predicted as not employed.
 
-The fairness gains are visible across the extended metrics. Predictive Parity decreases (0.1051 $\rightarrow$ 0.0971), NPV Equality becomes nearly equal (0.0335 $\rightarrow$ 0.0014), the AUC gap decreases (0.0531 $\rightarrow$ 0.0378), and Average Odds decreases (0.0620 $\rightarrow$ 0.0330). Disparate Impact also moves closer to parity, from 0.8886 to 0.9622. Across the complete evaluation set, 9 metrics improve in total: all 5 extended fairness metrics and 4 TFMA metrics (recall, true positive rate, false negative rate, and false omission rate).
+The fairness gains are visible across the extended metrics. Predictive Parity decreases (0.1051 $\rightarrow$ 0.0971), NPV Equality becomes nearly equal (0.0335 $\rightarrow$ 0.0014), the AUC gap decreases (0.0531 $\rightarrow$ 0.0378), and Average Odds decreases (0.0620 $\rightarrow$ 0.0330). Disparate Impact also moves closer to parity, from 0.8886 to 0.9622. Across the complete evaluation set (Table \ref{tab:double_win_scorecard} and Table \ref{tab:extended_fairness_comparison}), 12 metrics improve in total: all 5 extended fairness metrics and 7 TFMA metrics.
 
 \section{Comparative Study and Research}
 \label{sec:comparison}
