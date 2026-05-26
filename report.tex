@@ -60,7 +60,7 @@ We use the ACSEmployment dataset from the Folktables project, which contains Ame
 
 We evaluate bias using two complementary sets of metrics:
 
-\textbf{1. TFMA (TensorFlow Model Analysis) Metrics (13 metrics):}
+\textbf{1. TFMA (TensorFlow Model Analysis) Metrics (13 metrics): Table \ref{tab:performance_by_sex_baseline}}
 
 Standard classification metrics evaluated overall and per gender group:
 \begin{itemize}
@@ -73,7 +73,7 @@ Standard classification metrics evaluated overall and per gender group:
 \begin{table}[h]
 \centering
 \caption{Base Model Performance Metrics by Sex}
-\label{tab:performance_by_sex}
+\label{tab:performance_by_sex_baseline}
 \begin{tabular}{|l|c|c|c|}
 \hline
 \textbf{Metric} & \textbf{Female} & \textbf{Male} & \textbf{Overall} \\
@@ -99,7 +99,7 @@ Standard classification metrics evaluated overall and per gender group:
 \end{table}
 
 
-\textbf{2. Extended Fairness Metrics (5 metrics):}
+\textbf{2. Extended Fairness Metrics (5 metrics): Table \ref{tab:fairness_metrics_baseline}}
 
 Specialized metrics for quantifying bias:
 
@@ -117,8 +117,8 @@ Specialized metrics for quantifying bias:
 
 \begin{table}[h]
 \centering
-\caption{Base Model Fairness Metrics Summary}
-\label{tab:fairness_metrics}
+\caption{Base Model Extended Fairness Metrics Summary}
+\label{tab:fairness_metrics_baseline}
 \begin{tabular}{|l|c|c|c|}
 \hline
 \textbf{Fairness Metric} & \textbf{Value/Difference} & \textbf{Threshold} & \textbf{Status} \\
@@ -219,7 +219,7 @@ w_i = \frac{n}{2 \cdot n_{\text{gender}}} \times \begin{cases}
 
 \subsection{Evaluation of the Mitigated Model}
 
-We evaluate the mitigated model using the same 13 TFMA metrics and 5 extended fairness metrics as the baseline.
+We evaluate the mitigated model using the same 13 TFMA metrics (Table \ref{tab:fair_performance_by_sex}) and 5 extended fairness metrics (Table \ref{tab:fair_fairness_metrics}) as the baseline.
 
 \begin{table}[h]
 \centering
@@ -255,7 +255,7 @@ We evaluate the mitigated model using the same 13 TFMA metrics and 5 extended fa
 
 \begin{table}[h]
 \centering
-\caption{Fair Model Fairness Metrics Summary}
+\caption{Fair Model Extended Fairness Metrics Summary}
 \label{tab:fair_fairness_metrics}
 \begin{tabular}{|l|c|c|c|}
 \hline
