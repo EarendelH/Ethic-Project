@@ -25,7 +25,7 @@
 \maketitle
 
 \begin{abstract}
-This report evaluates gender fairness in employment prediction on the ACSEmployment dataset. We first benchmark a standard neural network with TFMA and five extended fairness metrics, then apply adversarial debiasing, an Equalized Odds loss, and sample re-weighting. The mitigated model improves the extended fairness score from 3/5 to 5/5, mainly by reducing predictive parity and AUC gaps. The improvement comes with a clear performance trade-off: recall increases, while precision, accuracy, and AUC decrease.
+This report evaluates gender fairness in employment prediction on the ACSEmployment dataset. We first benchmark a standard neural network with TFMA and five extended fairness metrics, then apply adversarial debiasing, an Equalized Odds loss, and sample re-weighting. The mitigated model improves all five extended fairness metrics, mainly by reducing predictive parity and AUC gaps. The improvement comes with a clear performance trade-off: recall increases, while precision, accuracy, and AUC decrease.
 \end{abstract}
 
 \section{Dataset and Benchmark Analysis}
@@ -144,8 +144,6 @@ Specialized metrics for quantifying bias:
 \quad Female AUC & 0.8713 &  &  \\
 \quad Male AUC & 0.9244 &  &  \\
 \quad AUC Gap & 0.0531 & $\leq 0.05$ & Unfair  \\
-\hline
-\multicolumn{4}{|c|}{\textbf{Overall Fairness: 3 out of 5 metrics pass}} \\
 \hline
 \end{tabular}
 \end{table}
@@ -287,7 +285,22 @@ We evaluate the mitigated model using the same 13 TFMA metrics and 5 extended fa
 \quad Male AUC & 0.8994 &  &  \\
 \quad AUC Gap & 0.0378 & $\leq 0.05$ & Fair  \\
 \hline
-\multicolumn{4}{|c|}{\textbf{Overall Fairness: 5 out of 5 metrics pass}} \\
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Extended Fairness Metric Comparison}
+\label{tab:extended_fairness_comparison}
+\begin{tabular}{|l|c|c|c|}
+\hline
+\textbf{Metric} & \textbf{Base Model} & \textbf{Fair Model} & \textbf{Change} \\
+\hline
+Disparate Impact Ratio & 0.8886 & 0.9622 & Closer to 1 \\
+Average Odds Difference & 0.0620 & 0.0330 & -0.0290 \\
+Predictive Parity Gap & 0.1051 & 0.0971 & -0.0080 \\
+NPV Equality Gap & 0.0335 & 0.0014 & -0.0321 \\
+AUC Gap & 0.0531 & 0.0378 & -0.0153 \\
 \hline
 \end{tabular}
 \end{table}
@@ -297,7 +310,7 @@ We evaluate the mitigated model using the same 13 TFMA metrics and 5 extended fa
 
 Compared with the baseline, the fair model raises overall recall from 0.8481 to 0.9265 and reduces the false negative rate from 0.1519 to 0.0735. This is important in an employment setting because false negatives correspond to qualified individuals being predicted as not employed.
 
-The fairness gains are visible across the extended metrics. Predictive Parity moves below the threshold (0.1051 $\rightarrow$ 0.0971), NPV Equality becomes nearly equal (0.0335 $\rightarrow$ 0.0014), the AUC gap becomes acceptable (0.0531 $\rightarrow$ 0.0378), and Average Odds decreases (0.0620 $\rightarrow$ 0.0330). Disparate Impact also moves closer to parity, from 0.8886 to 0.9622.
+The fairness gains are visible across the extended metrics. Predictive Parity decreases (0.1051 $\rightarrow$ 0.0971), NPV Equality becomes nearly equal (0.0335 $\rightarrow$ 0.0014), the AUC gap decreases (0.0531 $\rightarrow$ 0.0378), and Average Odds decreases (0.0620 $\rightarrow$ 0.0330). Disparate Impact also moves closer to parity, from 0.8886 to 0.9622. Across the complete evaluation set, 9 metrics improve in total: all 5 extended fairness metrics and 4 TFMA metrics (recall, true positive rate, false negative rate, and false omission rate).
 
 \section{Comparative Study and Research}
 \label{sec:comparison}
@@ -343,12 +356,12 @@ To preserve predictive utility while reducing fairness gaps, we employed several
 
 \section{Conclusion}
 
-This project shows that fairness constraints can substantially improve group-level equity in employment prediction, but the improvement is not free. The fair model satisfies all five extended fairness metrics and retains usable predictive performance (AUC: 0.8784), while accepting lower accuracy and precision.
+This project shows that fairness constraints can substantially improve group-level equity in employment prediction, but the improvement is not free. The fair model improves all five extended fairness metrics and retains usable predictive performance (AUC: 0.8784), while accepting lower accuracy and precision.
 
 \textbf{Key Findings:}
 
 \begin{enumerate}
-    \item \textbf{Fairness is achievable:} Through adversarial debiasing, Equalized Odds constraints, and sample re-weighting, the model improves from 3/5 to 5/5 extended fairness metrics.
+    \item \textbf{Fairness is achievable:} Through adversarial debiasing, Equalized Odds constraints, and sample re-weighting, the model improves all five extended fairness metrics.
 
     \item \textbf{Performance cost is measurable:} Accuracy decreases from 0.8202 to 0.7922 and AUC from 0.9016 to 0.8784, while recall increases from 0.8481 to 0.9265.
 
